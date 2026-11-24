@@ -27,7 +27,8 @@ export function validState(s) {
     Array.isArray(s.cards)&&s.cards.length===N&&s.cards.every(c=>Array.isArray(c)&&c.length===25&&c[12]===null&&
       c.every((v,i)=>i===12||Number.isInteger(v)&&v>Math.floor(i%5)*15&&v<=Math.floor(i%5)*15+15)&&new Set(c).size===25);
 }
-export function newState() { return {version:1,room:crypto.randomUUID(),revision:0,updated:Date.now(),names:Array(N).fill(''),drawn:[],winners:[],cards:makeCards()}; }
+export function randomID(){if(typeof crypto.randomUUID==='function')return crypto.randomUUID();const b=crypto.getRandomValues(new Uint8Array(16));b[6]=(b[6]&15)|64;b[8]=(b[8]&63)|128;const h=Array.from(b,x=>x.toString(16).padStart(2,'0')).join('');return `${h.slice(0,8)}-${h.slice(8,12)}-${h.slice(12,16)}-${h.slice(16,20)}-${h.slice(20)}`;}
+export function newState() { return {version:1,room:randomID(),revision:0,updated:Date.now(),names:Array(N).fill(''),drawn:[],winners:[],cards:makeCards()}; }
 export function recordWinner(s,no) {
   if (!Number.isInteger(no)||no<1||no>N||s.winners.some(w=>w.no===no)||s.winners.length===N) return false;
   s.winners.push({no,at:s.drawn.length}); return true;

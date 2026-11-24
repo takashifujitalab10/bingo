@@ -1,224 +1,215 @@
-import {N,prizeOf,shuffle,makeCards,validState,newState,recordWinner,snapshot,validSnapshot,encodeWatch,decodeWatch} from './core.mjs';
-const $=id=>document.getElementById(id), KEY='party-bingo-v1', pad=n=>String(n).padStart(2,'0');
-let state, owner=false, spinning=false, activeView='game', filter='all', peer=null, connections=new Set(), shareGeneration=0, shareTimer, viewerConnection, viewerReconnect, lastContact=0, viewerData, lastQR='', celebrationTimer, frame, soundNodes=[];
-let prefs={sound:true,volume:65,publicURL:''};
-try { prefs={...prefs,...JSON.parse(localStorage.getItem('party-bingo-preferences')||'{}')}; } catch {}
-const notify=text=>{$('notice').textContent=text;$('notice').hidden=!text;};
-const nameOf=no=>state.names[no-1]||`参加者${pad(no)}`;
-const el=(tag,cls,text)=>{const n=document.createElement(tag);if(cls)n.className=cls;if(text!==undefined)n.textContent=text;return n;};
-function savePrefs(){try{localStorage.setItem('party-bingo-preferences',JSON.stringify(prefs));}catch{notify('設定を保存できません。このブラウザーの保存容量・プライベートモードをご確認ください。');}}
+import {N,prizeOf,shuffle,makeCards,newState,validState,recordWinner,randomID} from './core.mjs';
+import {recentHistory,publicSnapshot,validPublic,encodePublic,decodePublic} from './share-core.mjs';
+const $=id=>document.getElementById(id), KEY='party-bingo-v1', PREF='party-bingo-screen-prefs', pad=n=>String(n).padStart(2,'0');
+const isViewer=new URLSearchParams(location.search).get('view')==='watch';
+let state,viewData,owner=false,peopleOpen=false,spinning=false,qrURL='',qrTimer,peer=null,peers=new Set(),shareEpoch=0,heartbeat,retryTimer,viewerConn=null,lastReceived=0,viewerPending=false,frame,renderedQRRevision=-1;
+const memory=new Map();let persistent=true;
+const storage={get(key){if(!persistent)return memory.get(key)||null;try{const v=localStorage.getItem(key);if(v!==null)memory.set(key,v);return v;}catch{persistent=false;return memory.get(key)||null;}},set(key,value){memory.set(key,value);if(persistent)try{localStorage.setItem(key,value);}catch{persistent=false;}}};
+let prefs={sound:true,volume:75,publicURL:''};try{prefs={...prefs,...JSON.parse(storage.get(PREF)||'{}')};}catch{}
+const node=(tag,cls,text)=>{const e=document.createElement(tag);if(cls)e.className=cls;if(text!==undefined)e.textContent=text;return e;};
+const nameOf=(data,no)=>data.names[no-1]||`参加者${pad(no)}`;
+const notify=text=>{$('notice').textContent=text;};
+const savePrefs=()=>storage.set(PREF,JSON.stringify(prefs));
+function storageStatus(){$('saveStatus').textContent=persistent?'このブラウザーへ自動保存':'一時保存モード：終了前に「データを保存」でバックアップしてください。';}
 function commit(change){
- if(!owner||spinning){return false;}
- try {
-  const disk=JSON.parse(localStorage.getItem(KEY)||'null');
-  if(disk&&disk.revision>state.revision){state=disk;render();notify('別画面の変更を取り込みました。操作をもう一度お試しください。');return false;}
-  const next=structuredClone(state); if(change(next)===false)return false;
-  next.revision=state.revision+1;next.updated=Date.now();
-  if(!validState(next))throw Error('invalid data');
-  localStorage.setItem(KEY,JSON.stringify(next));state=next;render();broadcast();return true;
- }catch{notify('データを保存できません。操作は確定していません。ブラウザーの保存設定を確認し、データを保存してから再読み込みしてください。');return false;}
+ if(!owner||spinning)return false;
+ try{
+  let disk=null;try{disk=JSON.parse(storage.get(KEY)||'null');}catch{}
+  if(validState(disk)&&disk.revision>state.revision){state=disk;renderHost();notify('別画面の変更を取り込みました。操作をもう一度お試しください。');return false;}
+  const next=structuredClone(state);if(change(next)===false)return false;
+  next.revision=state.revision+1;next.updated=Date.now();if(!validState(next))throw Error('invalid state');
+  storage.set(KEY,JSON.stringify(next));state=next;renderHost();broadcast();storageStatus();return true;
+ }catch{notify('操作を確定できませんでした。保存データを確認してください。');return false;}
 }
 function ask(title,text,ok='確定する'){
- if($('confirmDialog').open)return Promise.resolve(false);
- $('dialogTitle').textContent=title;$('dialogText').textContent=text;$('dialogOK').textContent=ok;
- const d=$('confirmDialog');d.returnValue='';d.showModal();
+ const d=$('confirmDialog');if(d.open)return Promise.resolve(false);
+ $('confirmTitle').textContent=title;$('confirmText').textContent=text;$('confirmOK').textContent=ok;d.returnValue='';d.showModal();
  return new Promise(resolve=>d.addEventListener('close',()=>resolve(d.returnValue==='ok'),{once:true}));
 }
-function showView(view){activeView=view;document.querySelectorAll('#host>.view').forEach(v=>v.classList.toggle('active',v.id===view));document.querySelectorAll('[data-view]').forEach(b=>b.classList.toggle('active',b.dataset.view===view));if(view==='setup')renderNames();if(view==='print')renderPrint();}
 function renderBoard(target,drawn){
- const set=new Set(drawn),last=drawn.at(-1),frag=document.createDocumentFragment();
+ const called=new Set(drawn),last=drawn.at(-1),fragment=document.createDocumentFragment();
  for(let c=0;c<5;c++){
-  frag.append(el('span','group-letter','BINGO'[c]));
-  for(let i=1;i<=15;i++){const n=c*15+i,d=el('span','num'+(set.has(n)?' on':'')+(last===n?' latest':''),n);d.dataset.group=c;d.style.setProperty('--r',i);d.setAttribute('aria-label',`${n} ${set.has(n)?'抽選済み':'未抽選'}${last===n?' 最新':''}`);frag.append(d);}
+  fragment.append(node('span',`board-letter g${c}`,'BINGO'[c]));
+  for(let r=1;r<=15;r++){const number=c*15+r,n=node('span','num'+(called.has(number)?' on':'')+(last===number?' latest':''),number);n.style.setProperty('--c',c+1);n.style.setProperty('--r',r);n.setAttribute('aria-label',`${number} ${called.has(number)?'抽選済み':'未抽選'}${last===number?' 最新':''}`);fragment.append(n);}
  }
- target.replaceChildren(frag);
+ target.replaceChildren(fragment);
 }
-function renderHistory(target,drawn){target.replaceChildren(...drawn.slice().reverse().map((n,i)=>{const li=el('li');li.append(el('small','',`${drawn.length-i}回目`),el('b','',n));return li;}));}
-function render(){
+function renderHistory(target,drawn){
+ const recent=recentHistory(drawn);target.replaceChildren(...Array.from({length:5},(_,i)=>{const li=node('li',recent[i]?'':'empty-history');li.append(node('small','',recent[i]?`${recent[i].order}回目`:'—'),node('b','',recent[i]?.number??'—'));return li;}));
+}
+function participantResult(data,no){const rank=data.winners.findIndex(w=>w.no===no)+1;const result=node('span','person-result');if(rank)result.append(node('strong','',`${prizeOf(rank)}等`),node('small','',`${rank}位・BINGO`));else result.append(node('span','','未当選'));return {rank,result};}
+function renderPeople(target,data,interactive){
+ target.replaceChildren(...Array.from({length:N},(_,i)=>{
+  const no=i+1,{rank,result}=participantResult(data,no),label=node(interactive?'label':'div',interactive?'person-card'+(rank?' won':''):'mobile-person'+(rank?' won':''));
+  if(interactive){const check=node('input');check.type='checkbox';check.checked=rank>0;check.disabled=!owner||!!rank||spinning;check.setAttribute('aria-label',`${nameOf(data,no)}をビンゴ当選にする`);check.onchange=()=>{check.checked=false;declare(no);};label.append(check);}
+  const name=node('span','person-name',nameOf(data,no));name.title=nameOf(data,no);label.append(node('span','person-no',pad(no)),name,result);return label;
+ }));
+}
+function renderHost(){
  const count=state.winners.length,finished=count===N;
- $('ball').textContent=state.drawn.at(-1)||'?';$('drawCount').textContent=state.drawn.length;$('progress').textContent=`当選 ${count} / 27人`;
- $('remaining').textContent=`残り${N-count}人`;$('historyCount').textContent=`${state.drawn.length}件`;$('historyEmpty').hidden=state.drawn.length>0;
- $('draw').disabled=!owner||spinning||finished||state.drawn.length===75;
- $('draw').textContent=finished?'全員ビンゴ！':state.drawn.length===75?'全75番号を抽選済み':'番号を引く';if(!finished&&state.drawn.length<75)$('draw').append(el('kbd','','Space'));
- $('drawHint').textContent=finished?'27人全員の当選が確定しました':state.drawn.length===75?'残りの方のビンゴを確認してください':'1〜75の番号を重複なしで抽選';
- $('nextPrize').replaceChildren(finished?'全員の当選が確定！':'次のビンゴは ');if(!finished)$('nextPrize').append(el('strong','',`${prizeOf(count+1)}等`));
- $('nextRank').textContent=finished?'おめでとうございます！':`${count+1}人目の当選`;
- $('prizePlan').replaceChildren(...['1位','2〜3位','4〜6位','7〜10位','11〜27位'].map((r,i)=>{const p=el('div',!finished&&prizeOf(count+1)===i+1?'current':'',`${i+1}等`);p.append(el('small','',r));return p;}));
- renderBoard($('board'),state.drawn);renderHistory($('history'),state.drawn);renderPeople();
- $('winners').replaceChildren(...state.winners.map((w,i)=>{const li=el('li');li.append(el('span','rank',`${i+1}位`),el('span',`prize-badge p${prizeOf(i+1)}`,`${prizeOf(i+1)}等`),el('span','winner-name',nameOf(w.no)));return li;}));
- if(!count)$('winners').append(el('p','empty','最初のビンゴを待っています。'));
- $('winnerCount').textContent=`${count}人`;$('undoWinner').disabled=!owner||spinning||!count;
- $('undoDraw').disabled=!owner||spinning||!state.drawn.length||state.winners.some(w=>w.at>=state.drawn.length);
- $('celebrate').disabled=!owner||spinning;$('testSound').disabled=!owner||spinning;
- for(const id of ['resetResults','resetPeople','resetAll','applyNames','importData'])$(id).disabled=!owner||spinning;
- renderQR();
+ if(!spinning)$('ball').textContent=state.drawn.at(-1)||'?';$('drawCount').textContent=state.drawn.length;
+ $('nextLabel').textContent=finished?'27人全員':'次のビンゴは';$('nextPrize').classList.toggle('finished-grade',finished);
+ $('nextPrize').replaceChildren(finished?'ビンゴ！':String(prizeOf(count+1)));if(!finished)$('nextPrize').append(node('span','','等'));
+ $('nextRank').textContent=finished?'おめでとうございます':`${count+1}位の当選`;
+ $('remaining').replaceChildren('残り ',node('strong','',N-count),' 人');
+ $('peopleSummary').textContent=`当選 ${count} / 27人`;
+ const ranges=['1位','2〜3位','4〜6位','7〜10位','11〜27位'];
+ $('prizePlan').replaceChildren(...ranges.map((r,i)=>{const e=node('div',!finished&&prizeOf(count+1)===i+1?'current':'',`${i+1}等`);e.append(node('small','',r));return e;}));
+ renderBoard($('board'),state.drawn);renderHistory($('history'),state.drawn);renderPeople($('peopleGrid'),state,true);
+ $('draw').disabled=!owner||spinning||finished||state.drawn.length>=75;
+ $('draw').replaceChildren(finished?'全員ビンゴ！':state.drawn.length===75?'全75番号を抽選済み':'番号を引く');if(!finished&&state.drawn.length<75)$('draw').append(node('kbd','','Space'));
+ $('bingo').disabled=!owner||spinning||!count;
+ $('undoWinner').disabled=!owner||spinning||!count;$('undoDraw').disabled=!owner||spinning||!state.drawn.length||state.winners.some(w=>w.at>=state.drawn.length);
+ ['applyNames','importData','resetResults','resetPeople','resetAll'].forEach(id=>$(id).disabled=!owner||spinning);
+ clearTimeout(qrTimer);qrTimer=setTimeout(renderQR,180);
 }
-function renderPeople(){
- const q=$('search').value.trim().toLowerCase();const nodes=[];
- for(let i=1;i<=N;i++){
-  const rank=state.winners.findIndex(w=>w.no===i)+1,won=rank>0;
-  if(filter==='waiting'&&won||filter==='won'&&!won||q&&!`${nameOf(i)} ${i} ${pad(i)}`.toLowerCase().includes(q))continue;
-  const row=el('label','person'+(won?' won':'')),check=el('input');check.type='checkbox';check.checked=won;check.disabled=won||!owner||spinning;check.setAttribute('aria-label',`${nameOf(i)}をビンゴ当選にする`);
-  check.addEventListener('change',()=>{check.checked=false;declare(i);});
-  row.append(check,el('span','person-no',pad(i)),el('span','person-name',nameOf(i)));
-  if(won)row.append(el('span','won-label',`${rank}位・${prizeOf(rank)}等`));nodes.push(row);
- }
- $('participants').replaceChildren(...nodes);if(!nodes.length)$('participants').append(el('p','empty','該当する参加者はいません。'));
-}
+function togglePeople(){peopleOpen=!peopleOpen;$('gameView').hidden=peopleOpen;$('peopleView').hidden=!peopleOpen;$('togglePeople').textContent=peopleOpen?'番号画面に戻る':'参加者チェック';$('togglePeople').setAttribute('aria-pressed',String(peopleOpen));}
 async function declare(no){
  if(!owner||spinning||state.winners.some(w=>w.no===no))return;
- const rank=state.winners.length+1,revision=state.revision;
- if(await ask('ビンゴの当選を確定',`${nameOf(no)} さん（No.${pad(no)}）\n${rank}位 ／ ${prizeOf(rank)}等\n\n紙のカードを確認してから確定してください。`,'当選を確定')){
-  if(state.revision!==revision){notify('確認中にデータが変わりました。もう一度チェックしてください。');return;}
-  if(commit(s=>recordWinner(s,no)))notify(`${nameOf(no)} さん：${rank}位・${prizeOf(rank)}等で確定。右下のボタンでお祝いできます。`);
+ const revision=state.revision,rank=state.winners.length+1;
+ if(await ask('ビンゴの当選を確定',`${nameOf(state,no)} さん\n${rank}位 ／ ${prizeOf(rank)}等\n\n紙のカードを確認してから確定してください。`,'当選を確定')){
+  if(revision!==state.revision){notify('確認中にデータが変わりました。もう一度チェックしてください。');return;}
+  if(commit(s=>recordWinner(s,no)))notify(`${nameOf(state,no)} さん・${prizeOf(rank)}等で確定。「ビンゴ！」でお祝いできます。`);
  }
-}
-async function draw(){
- if($('draw').disabled||$('confirmDialog').open||!$('celebration').hidden)return;
- spinning=true;$('draw').disabled=true;renderPeople();['undoDraw','undoWinner','celebrate','testSound','resetResults','resetPeople','resetAll','applyNames','importData'].forEach(id=>$(id).disabled=true);
- const rest=shuffle(Array.from({length:75},(_,i)=>i+1).filter(n=>!state.drawn.includes(n))),number=rest[0],start=performance.now();
- try { await prepareAudio(); }catch{}
- $('ball').classList.add('rolling');$('ball').setAttribute('aria-live','off');
- const reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
- function tick(){const elapsed=performance.now()-start;if(elapsed<(reduced?300:2200)){$('ball').textContent=rest[Math.floor(Math.random()*rest.length)];tickSound();setTimeout(tick,45+elapsed/15);return;}
-  spinning=false;$('ball').classList.remove('rolling');$('ball').setAttribute('aria-live','polite');
-  if(commit(s=>{if(s.drawn.includes(number))return false;s.drawn.push(number);}))resultSound();else render();
- }
- tick();
-}
-function renderNames(){
- $('nameList').replaceChildren(...state.names.map((name,i)=>{const label=el('label','name-row');label.append(el('span','',pad(i+1)));const input=el('input');input.type='text';input.value=name;input.maxLength=60;input.placeholder=`参加者${pad(i+1)}`;input.disabled=!owner;input.setAttribute('aria-label',`参加者${pad(i+1)}の名前`);input.addEventListener('input',()=>{if(commit(s=>s.names[i]=input.value.trim()))$('saved').textContent='名前を保存しました。';});label.append(input);return label;}));
- $('sound').checked=!!prefs.sound;$('volume').value=prefs.volume;$('publicURL').value=prefs.publicURL||'';
-}
-function renderPrint(){
- const sheets=[];
- for(let page=0;page<3;page++){
-  const sheet=el('div','print-sheet');
-  for(let j=0;j<9;j++){const i=page*9+j,card=el('article','pcard');card.append(el('div','phead',`忘年会ビンゴ No.${pad(i+1)}`),el('div','pname',`名前：${state.names[i]||''}`));const table=el('table'),head=el('tr');for(const c of 'BINGO')head.append(el('th','',c));table.append(head);for(let r=0;r<5;r++){const tr=el('tr');for(let c=0;c<5;c++){const n=state.cards[i][r*5+c];tr.append(el('td',n===null?'free':'',n??'FREE'));}table.append(tr);}card.append(table);sheet.append(card);}sheets.push(sheet);
- }
- $('printArea').replaceChildren(...sheets);
-}
-function baseURL(){const u=new URL(prefs.publicURL||location.href);u.hash='';u.search='';if(!['https:','http:'].includes(u.protocol))throw Error('public url required');return u.href;}
-function viewerURL(){return `${baseURL()}#watch=${encodeWatch(state)}`;}
-function renderQR(){
- try {const url=viewerURL();if(lastQR===url)return;lastQR=url;const qr=qrcode(0,'M');qr.addData(url,'Byte');qr.make();$('qr').innerHTML=qr.createSvgTag({cellSize:3,margin:12,scalable:true});}
- catch{$('qr').replaceChildren(el('p','helper','GitHub Pagesの公開URLで開くとQRが表示されます。'));}
-}
-function shareStatus(text){if($('shareState'))$('shareState').textContent=text;}
-function cleanupShare(){shareGeneration++;clearInterval(shareTimer);clearTimeout(viewerReconnect);if(viewerConnection)viewerConnection.close();viewerConnection=null;for(const c of connections)c.close();connections.clear();if(peer)peer.destroy();peer=null;}
-function broadcast(){const data=snapshot(state);for(const c of connections){if(c.open){try{c.send(data);}catch{connections.delete(c);}}}}
-function startHostSharing(){
- cleanupShare();const gen=shareGeneration;
- if(!owner)return;
- if(typeof Peer==='undefined'){shareStatus('自動更新を開始できません。最新QRで履歴を共有できます');return;}
- if(location.protocol==='file:'){shareStatus('GitHub Pages公開後に共有できます');return;}
- shareStatus('スマホとの自動更新を準備中');
- try {peer=new Peer(`party-bingo-${state.room}`,{debug:0,secure:true});}catch{shareStatus('自動更新は利用できません。最新QRを読み取ってください');return;}
- const current=peer;
- peer.on('open',()=>{if(gen!==shareGeneration)return;shareStatus(`共有受付中・接続 ${connections.size}台`);});
- peer.on('connection',c=>{
-  if(gen!==shareGeneration||connections.size>=60){c.close();return;}
-  connections.add(c);
-  const timeout=setTimeout(()=>{if(!c.open){connections.delete(c);c.close();}},15000);
-  c.on('open',()=>{clearTimeout(timeout);if(gen!==shareGeneration){c.close();return;}c.send(snapshot(state));shareStatus(`共有受付中・接続 ${[...connections].filter(x=>x.open).length}台`);});
-  const close=()=>{clearTimeout(timeout);connections.delete(c);if(gen===shareGeneration)shareStatus(`共有受付中・接続 ${[...connections].filter(x=>x.open).length}台`);};c.on('close',close);c.on('error',close);
-  // Incoming data is deliberately ignored: viewers have no mutation channel.
- });
- peer.on('disconnected',()=>{if(gen!==shareGeneration)return;shareStatus('共有を再接続中。最新QRから履歴は開けます');setTimeout(()=>{if(gen===shareGeneration&&!current.destroyed)try{current.reconnect();}catch{}},3000);});
- peer.on('error',e=>{if(gen!==shareGeneration)return;shareStatus(e.type==='unavailable-id'?'共有IDは別画面で使用中。最新QRで履歴を共有できます':'自動更新は未接続。最新QRで履歴を共有できます');});
- shareTimer=setInterval(broadcast,5000);
-}
-function renderViewer(){const data=viewerData;$('viewerBall').textContent=data.drawn.at(-1)||'?';$('viewerCount').textContent=`${data.drawn.length} / 75 番号`;$('viewerHistoryCount').textContent=`${data.drawn.length}件`;renderBoard($('viewerBoard'),data.drawn);renderHistory($('viewerHistory'),data.drawn);$('updated').textContent=`履歴の更新日時：${new Date(data.updated).toLocaleString('ja-JP')}`;}
-function viewerStatus(text,live=false){$('viewerStatus').textContent=text;$('viewerStatus').className='viewer-status '+(live?'live':'stale');}
-function startViewerSharing(){
- cleanupShare();const gen=shareGeneration;
- viewerStatus('QR読み取り時の履歴を表示中。自動更新に接続しています。');lastContact=0;
- if(typeof Peer==='undefined'){viewerStatus('自動更新を利用できません。最新のQRを読み直してください。');return;}
- try{peer=new Peer(`party-view-${crypto.randomUUID()}`,{debug:0,secure:true});}catch{viewerStatus('この端末は自動更新に対応していません。最新のQRを読み直してください。');return;}
- const current=peer;
- const scheduleRetry=()=>{if(gen!==shareGeneration)return;clearTimeout(viewerReconnect);viewerReconnect=setTimeout(()=>{if(gen!==shareGeneration)return;if(current.disconnected){try{current.reconnect();}catch{}scheduleRetry();}else if(current.open)connect();},6000);};
- const connect=()=>{
-  if(gen!==shareGeneration)return;if(viewerConnection){const old=viewerConnection;viewerConnection=null;old.close();}
-  const c=current.connect(`party-bingo-${viewerData.room}`,{serialization:'json',reliable:true});viewerConnection=c;
-  const timeout=setTimeout(()=>{if(gen===shareGeneration&&lastContact===0){viewerStatus('自動更新に接続できません。最新のQRを読み直すと新しい履歴を表示できます。');c.close();scheduleRetry();}},16000);
-  c.on('open',()=>{if(gen!==shareGeneration)return;viewerStatus('司会者と接続中。最新の履歴を待っています。');});
-  c.on('data',p=>{
-   if(gen!==shareGeneration||!validSnapshot(p,viewerData.room)||p.revision<viewerData.revision)return;
-   clearTimeout(timeout);lastContact=Date.now();viewerData=p;renderViewer();viewerStatus('自動更新中・司会者の抽選と連動しています',true);
-   try{history.replaceState(null,'',`#watch=${encodeWatch(p)}`);}catch{}
-  });
-  const disconnected=()=>{clearTimeout(timeout);if(gen!==shareGeneration||viewerConnection!==c)return;viewerStatus('接続が切れました。表示中の履歴は最終受信時点です。再接続しています。');scheduleRetry();};
-  c.on('close',disconnected);c.on('error',disconnected);
- };
- peer.on('open',()=>{viewerStatus('番号履歴を受信する接続を開始しています。');connect();});peer.on('error',()=>{if(gen!==shareGeneration)return;viewerStatus('自動更新は未接続です。最新のQRを読み直すと新しい履歴を表示できます。');scheduleRetry();});
- peer.on('disconnected',()=>{if(gen!==shareGeneration)return;viewerStatus('再接続中。表示中の履歴は最終受信時点です。');scheduleRetry();});
- const waitingSince=Date.now();
- shareTimer=setInterval(()=>{if(!lastContact&&Date.now()-waitingSince>15000)viewerStatus('自動更新に接続できません。最新のQRを読み直すと新しい履歴を表示できます。');if(lastContact&&Date.now()-lastContact>18000)viewerStatus('更新の受信が止まっています。接続をやり直すか、最新のQRを読み直してください。');},4000);
 }
 let audioContext;
-async function prepareAudio(){if(!prefs.sound)return null;const A=window.AudioContext||window.webkitAudioContext;if(!A)return null;audioContext??=new A();if(audioContext.state==='suspended')await audioContext.resume();return audioContext;}
-function tone(freq,at,duration,type='triangle',gain=.08){if(!audioContext||!prefs.sound)return;const o=audioContext.createOscillator(),g=audioContext.createGain();o.type=type;o.frequency.value=freq;g.gain.setValueAtTime(.001,at);g.gain.linearRampToValueAtTime(gain*Number(prefs.volume)/100,at+.025);g.gain.exponentialRampToValueAtTime(.001,at+duration);o.connect(g).connect(audioContext.destination);o.start(at);o.stop(at+duration+.03);soundNodes.push(o);o.onended=()=>{o.disconnect();g.disconnect();soundNodes=soundNodes.filter(x=>x!==o);};}
-function noise(at,duration,gain=.06){if(!audioContext||!prefs.sound)return;const b=audioContext.createBuffer(1,Math.ceil(audioContext.sampleRate*duration),audioContext.sampleRate),a=b.getChannelData(0);for(let i=0;i<a.length;i++)a[i]=(Math.random()*2-1);const s=audioContext.createBufferSource(),f=audioContext.createBiquadFilter(),g=audioContext.createGain();f.type='highpass';f.frequency.value=1800;s.buffer=b;g.gain.setValueAtTime(gain*Number(prefs.volume)/100,at);g.gain.exponentialRampToValueAtTime(.001,at+duration);s.connect(f).connect(g).connect(audioContext.destination);s.start(at);soundNodes.push(s);s.onended=()=>{s.disconnect();f.disconnect();g.disconnect();soundNodes=soundNodes.filter(x=>x!==s);};}
-function stopSound(){for(const n of soundNodes)try{n.stop();}catch{}soundNodes=[];}
-function tickSound(){if(audioContext)tone(600,audioContext.currentTime,.035,'sine',.025);}
-function resultSound(){if(audioContext){tone(880,audioContext.currentTime,.35,'triangle',.11);tone(1318.5,audioContext.currentTime+.12,.6,'triangle',.09);}}
-async function fanfare(){
- try{const a=await prepareAudio();if(!a)return;stopSound();const t=a.currentTime+.04;
-  const melody=[[523.25,0,.18],[523.25,.22,.18],[523.25,.44,.2],[659.25,.7,.36],[783.99,1.12,.35],[1046.5,1.55,.7],[987.77,2.3,.25],[1046.5,2.6,1.6]];
-  melody.forEach(([f,at,d])=>{tone(f,t+at,d,'sawtooth',.045);tone(f/2,t+at,d,'triangle',.07);});
-  [[0,[130.81,261.63,329.63,392]],[.7,[174.61,349.23,440,523.25]],[1.55,[196,392,493.88,587.33]],[2.6,[130.81,261.63,329.63,392,523.25]]].forEach(([at,chord])=>chord.forEach(f=>tone(f,t+at,at===2.6?1.9:.6,'triangle',.035)));
-  for(let i=0;i<14;i++)noise(t+i*.11,.07,.025+i*.0015);noise(t+1.55,1.1,.07);noise(t+2.6,1.8,.1);
- }catch{notify('音を再生できません。端末の音量・消音設定を確認し、もう一度ボタンを押してください。');}
+function tickSound(final=false){
+ if(!prefs.sound)return;
+ try{audioContext??=new(window.AudioContext||window.webkitAudioContext)();if(audioContext.state==='suspended')audioContext.resume().catch(()=>{});const oscillator=audioContext.createOscillator(),gain=audioContext.createGain(),time=audioContext.currentTime,duration=final?.35:.035;oscillator.type='sine';oscillator.frequency.value=final?1174.7:680;gain.gain.setValueAtTime((final?.12:.035)*Number(prefs.volume)/100,time);gain.gain.exponentialRampToValueAtTime(.001,time+duration);oscillator.connect(gain).connect(audioContext.destination);oscillator.start(time);oscillator.stop(time+duration);oscillator.onended=()=>{oscillator.disconnect();gain.disconnect();};}catch{}
+}
+function draw(){
+ if($('draw').disabled||$('confirmDialog').open||$('settingsDialog').open||$('qrDialog').open||$('celebration').open)return;
+ if(peopleOpen)togglePeople();
+ spinning=true;renderHost();const rest=shuffle(Array.from({length:75},(_,i)=>i+1).filter(n=>!state.drawn.includes(n))),selected=rest[0],start=performance.now(),reduced=matchMedia('(prefers-reduced-motion: reduce)').matches;
+ $('ball').classList.add('rolling');$('ball').setAttribute('aria-live','off');
+ const tick=()=>{const elapsed=performance.now()-start;if(elapsed<(reduced?250:2200)){$('ball').textContent=rest[Math.floor(Math.random()*rest.length)];tickSound();setTimeout(tick,40+elapsed/18);return;}
+  spinning=false;$('ball').classList.remove('rolling');$('ball').setAttribute('aria-live','polite');
+  if(commit(s=>{if(s.drawn.includes(selected))return false;s.drawn.push(selected);}))tickSound(true);else renderHost();
+ };tick();
+}
+function renderNames(){
+ $('nameFields').replaceChildren(...state.names.map((name,i)=>{const label=node('label','name-field'),input=node('input');input.type='text';input.value=name;input.maxLength=60;input.placeholder=`参加者${pad(i+1)}`;input.disabled=!owner;input.setAttribute('aria-label',`参加者${pad(i+1)}の名前`);input.oninput=()=>{if(commit(s=>s.names[i]=input.value.trim()))storageStatus();};label.append(node('span','',pad(i+1)),input);return label;}));
+ $('sound').checked=!!prefs.sound;$('volume').value=prefs.volume;$('publicURL').value=prefs.publicURL||'';storageStatus();
+}
+function publicURL(){const url=new URL(prefs.publicURL||location.href);if(!['http:','https:'].includes(url.protocol))throw Error('HTTP URL required');url.hash='';url.search='';return url;}
+function makeViewerURL(){const url=publicURL();url.searchParams.set('view','watch');url.hash='s='+encodePublic(publicSnapshot(state));return url.href;}
+function renderQR(){
+ try{
+  const next=makeViewerURL();if(next===qrURL&&renderedQRRevision===state.revision)return;qrURL=next;
+  const q=qrcode(0,'M');q.addData(qrURL,'Byte');q.make();const svg=q.createSvgTag({cellSize:4,margin:16,scalable:true});$('qr').innerHTML=svg;$('largeQR').innerHTML=svg;renderedQRRevision=state.revision;
+ }catch{qrURL='';$('qr').replaceChildren(node('span','empty-view','QR準備中'));$('largeQR').replaceChildren(node('p','empty-view','公開URLで開いてください。名前が長すぎる場合は短くして登録してください。'));}
+}
+function setShareStatus(message){$('shareStatus').textContent=message;}
+function closeNetwork(){shareEpoch++;clearInterval(heartbeat);clearTimeout(retryTimer);viewerPending=false;const old=peer;peer=null;if(viewerConn){const c=viewerConn;viewerConn=null;try{c.close();}catch{}}for(const c of peers)try{c.close();}catch{}peers.clear();if(old)try{old.destroy();}catch{}}
+function broadcast(){if(!state)return;const p=publicSnapshot(state);for(const c of peers)if(c.open)try{c.send(p);}catch{peers.delete(c);}}
+function startHostSharing(){
+ closeNetwork();if(!owner)return;const epoch=shareEpoch;
+ if(typeof Peer==='undefined'||location.protocol==='file:'){setShareStatus('最新QRから履歴・参加者状況を閲覧できます');return;}
+ setShareStatus('自動更新を準備中・最新QRは利用可能');
+ const id=`bonenkai-screen-${state.room}`;
+ try{peer=new Peer(id,{secure:true,debug:0});}catch{setShareStatus('自動更新は未接続・最新QRを読み直してください');return;}
+ const current=peer,updateCount=()=>{if(epoch===shareEpoch)setShareStatus(`共有受付中・接続 ${[...peers].filter(c=>c.open).length}台`);};
+ current.on('open',updateCount);
+ current.on('connection',c=>{
+  if(epoch!==shareEpoch||peers.size>=60){c.close();return;}peers.add(c);
+  const timer=setTimeout(()=>{if(!c.open){peers.delete(c);c.close();}},15000);
+  c.on('open',()=>{clearTimeout(timer);if(epoch!==shareEpoch){c.close();return;}c.send(publicSnapshot(state));updateCount();});
+  const done=()=>{clearTimeout(timer);peers.delete(c);updateCount();};c.on('close',done);c.on('error',done);
+  // Viewers have no command or mutation handler, even if they send arbitrary data.
+ });
+ current.on('disconnected',()=>{if(epoch!==shareEpoch)return;setShareStatus('自動更新を再接続中・最新QRは利用可能');retryTimer=setTimeout(()=>{if(epoch===shareEpoch&&!current.destroyed)try{current.reconnect();}catch{}},3000);});
+ current.on('error',()=>{if(epoch===shareEpoch)setShareStatus('自動更新は未接続・最新QRから最新情報を確認');});
+ heartbeat=setInterval(broadcast,5000);
+}
+function renderViewer(){
+ const p=viewData,count=p.winners.length;$('viewerBall').textContent=p.drawn.at(-1)||'?';$('viewerCount').textContent=`${p.drawn.length} / 75 番号`;
+ $('viewerNext').textContent=count===N?'全員ビンゴ！':`次のビンゴは ${prizeOf(count+1)}等`;$('viewerRemaining').textContent=`残り${N-count}人`;
+ renderHistory($('viewerHistory'),p.drawn);renderBoard($('viewerBoard'),p.drawn);renderPeople($('viewerPeopleGrid'),p,false);
+ $('viewerUpdated').textContent=`情報の更新：${new Date(p.updated).toLocaleString('ja-JP')}`;
+}
+function viewerStatus(text,live=false){$('viewerStatus').textContent=text;$('viewerStatus').className=live?'live':'stale';}
+function startViewerSharing(){
+ closeNetwork();const epoch=shareEpoch,started=Date.now();lastReceived=0;
+ viewerStatus('QR読取時点の番号・参加者状況です。自動更新に接続中。');
+ if(typeof Peer==='undefined'){viewerStatus('QR読取時点の情報です。最新情報は会場の最新QRを読み直してください。');return;}
+ try{peer=new Peer(`bonenkai-guest-${randomID()}`,{secure:true,debug:0});}catch{viewerStatus('自動更新を利用できません。最新QRを読み直してください。');return;}
+ const current=peer;
+ const retry=()=>{if(epoch!==shareEpoch)return;clearTimeout(retryTimer);retryTimer=setTimeout(()=>{if(epoch!==shareEpoch)return;if(current.destroyed){startViewerSharing();return;}if(current.disconnected){try{current.reconnect();}catch{}retry();}else if(current.open)connect();else retry();},5000);};
+ function connect(){
+  if(epoch!==shareEpoch||viewerPending||viewerConn?.open)return;
+  if(viewerConn){const previous=viewerConn;viewerConn=null;previous.close();}
+  viewerPending=true;const c=current.connect(`bonenkai-screen-${viewData.room}`,{serialization:'json',reliable:true});viewerConn=c;
+  const timeout=setTimeout(()=>{if(epoch===shareEpoch&&viewerConn===c&&!lastReceived){viewerConn=null;viewerPending=false;c.close();viewerStatus('自動更新は未接続。最新QRを読み直すと、番号と参加者状況を更新できます。');retry();}},14000);
+  c.on('data',p=>{
+   if(epoch!==shareEpoch||viewerConn!==c||!validPublic(p,viewData.room)||p.revision<viewData.revision)return;
+   clearTimeout(timeout);viewerPending=false;lastReceived=Date.now();viewData=p;renderViewer();viewerStatus('自動更新中・司会者の抽選と連動しています',true);
+   try{history.replaceState(null,'',`${location.pathname}?view=watch#s=${encodePublic(p)}`);}catch{}
+  });
+  const disconnected=()=>{clearTimeout(timeout);if(epoch!==shareEpoch||viewerConn!==c)return;viewerConn=null;viewerPending=false;viewerStatus('接続が切れました。表示中の情報は最終受信時点です。');retry();};c.on('close',disconnected);c.on('error',disconnected);
+ }
+ current.on('open',connect);current.on('error',()=>{if(epoch!==shareEpoch)return;viewerPending=false;viewerStatus('自動更新は未接続。会場の最新QRから読み直してください。');retry();});
+ current.on('disconnected',()=>{if(epoch===shareEpoch){viewerStatus('再接続中。表示中の情報は最終受信時点です。');retry();}});
+ heartbeat=setInterval(()=>{if(epoch!==shareEpoch)return;if(lastReceived&&Date.now()-lastReceived>18000)viewerStatus('更新の受信が止まりました。再接続するか、最新QRを読み直してください。');else if(!lastReceived&&Date.now()-started>15000)viewerStatus('QR読取時点の情報です。最新の番号・参加者状況は会場の最新QRを読み直してください。');},4000);
+}
+function playBell(){
+ const bell=$('winnerBell');bell.pause();bell.currentTime=0;bell.volume=Math.min(1,Math.max(0,Number(prefs.volume)/100));if(!prefs.sound)return;
+ bell.play().catch(()=>notify('当選ベルを再生できません。音量と消音設定、assetsフォルダーを確認してください。'));
 }
 function confetti(){
  cancelAnimationFrame(frame);const canvas=$('confetti'),ctx=canvas.getContext('2d');if(!ctx||matchMedia('(prefers-reduced-motion: reduce)').matches)return;
- const w=innerWidth,h=innerHeight,dpr=Math.min(devicePixelRatio||1,2);canvas.width=w*dpr;canvas.height=h*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);const colors=['#ffbf45','#7947e8','#fa7b91','#42c7b4','#5eabed'];
- const pieces=Array.from({length:190},()=>({x:w/2,y:h*.4,vx:(Math.random()-.5)*19,vy:-Math.random()*17-3,r:Math.random()*6.28,color:colors[Math.floor(Math.random()*5)],size:5+Math.random()*7}));const start=performance.now();let prev=start;
- function animate(now){const dt=Math.min(2,(now-prev)/16.67);prev=now;ctx.clearRect(0,0,w,h);for(const p of pieces){p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=.15*dt;p.r+=.07*dt;ctx.save();ctx.translate(p.x,p.y);ctx.rotate(p.r);ctx.fillStyle=p.color;ctx.fillRect(-p.size/2,-p.size/2,p.size,p.size*.5);ctx.restore();}if(now-start<6500)frame=requestAnimationFrame(animate);else ctx.clearRect(0,0,w,h);}frame=requestAnimationFrame(animate);
+ const w=innerWidth,h=innerHeight,dpr=Math.min(devicePixelRatio||1,2);canvas.width=w*dpr;canvas.height=h*dpr;ctx.setTransform(dpr,0,0,dpr,0,0);const colors=['#e00a1a','#f2c100','#ff7134','#4bc1c5','#8958df'];
+ const pieces=Array.from({length:190},()=>({x:w/2,y:h*.45,vx:(Math.random()-.5)*20,vy:-Math.random()*18-4,r:Math.random()*6.28,size:5+Math.random()*8,color:colors[Math.floor(Math.random()*5)]}));let previous=performance.now();const start=previous;
+ const animate=now=>{const dt=Math.min(2,(now-previous)/16.67);previous=now;ctx.clearRect(0,0,w,h);for(const p of pieces){p.x+=p.vx*dt;p.y+=p.vy*dt;p.vy+=.15*dt;p.r+=.06*dt;ctx.save();ctx.translate(p.x,p.y);ctx.rotate(p.r);ctx.fillStyle=p.color;ctx.fillRect(-p.size/2,-p.size/2,p.size,p.size*.5);ctx.restore();}if(now-start<7000)frame=requestAnimationFrame(animate);else ctx.clearRect(0,0,w,h);};frame=requestAnimationFrame(animate);
 }
 function celebrate(){
- const w=state.winners.at(-1),rank=state.winners.length;$('celebrationName').textContent=w?`${nameOf(w.no)} さん`:'おめでとうございます！';$('celebrationPrize').textContent=w?`${rank}位・${prizeOf(rank)}等 当選！`:'ビンゴ！';$('celebration').hidden=false;$('closeCelebration').focus();confetti();fanfare();clearTimeout(celebrationTimer);celebrationTimer=setTimeout(closeCelebration,7500);
+ if(!owner||spinning||!state.winners.length)return;
+ const winner=state.winners.at(-1),rank=state.winners.length;$('celebrationName').textContent=`${nameOf(state,winner.no)} さん`;$('celebrationPrize').textContent=`${rank}位・${prizeOf(rank)}等 当選！`;
+ $('celebration').showModal();playBell();confetti();
 }
-function closeCelebration(){$('celebration').hidden=true;clearTimeout(celebrationTimer);stopSound();cancelAnimationFrame(frame);const c=$('confetti');c.getContext('2d')?.clearRect(0,0,c.width,c.height);$('celebrate').focus();}
+function stopCelebration(){const bell=$('winnerBell');bell.pause();bell.currentTime=0;cancelAnimationFrame(frame);const c=$('confetti');c.getContext('2d')?.clearRect(0,0,c.width,c.height);}
+function renderPrint(){
+ const sheets=[];for(let page=0;page<3;page++){const sheet=node('div','print-sheet');for(let j=0;j<9;j++){const i=page*9+j,card=node('article','pcard');card.append(node('div','phead',`忘年会ビンゴ No.${pad(i+1)}`),node('div','pname',`名前：${state.names[i]||''}`));const table=node('table'),head=node('tr');for(const letter of 'BINGO')head.append(node('th','',letter));table.append(head);for(let r=0;r<5;r++){const tr=node('tr');for(let c=0;c<5;c++){const n=state.cards[i][r*5+c];tr.append(node('td',n===null?'free':'',n??'FREE'));}table.append(tr);}card.append(table);sheet.append(card);}sheets.push(sheet);}$('printArea').replaceChildren(...sheets);
+}
 async function reset(kind){
- const configs={results:['抽選・当選結果をリセット','すべての抽選番号と当選記録を削除します。\n参加者名・印刷カードは残ります。'],people:['参加者データをリセット','27人の名前と当選記録を削除します。\n抽選番号と印刷カードは残ります。'],all:['すべてリセット','名前・抽選・当選記録を削除し、カードも新しくします。\n配布済みの印刷カードは使い直せません。']};
- if(await ask(...configs[kind],'リセットする')){if(commit(s=>{s.winners=[];if(kind!=='people')s.drawn=[];if(kind!=='results')s.names=Array(N).fill('');if(kind==='all')s.cards=makeCards();})){renderNames();notify('リセットしました。');}}
+ const descriptions={results:['抽選・当選結果をリセット','番号履歴と当選記録を消去します。名前・カードは残します。'],people:['参加者データをリセット','名前・当選記録を消去します。番号履歴・カードは残します。'],all:['すべてリセット','名前・抽選・当選記録を消去し、カードを作り直します。配布済みのカードは印刷し直してください。']};
+ if(await ask(...descriptions[kind],'リセットする'))if(commit(s=>{s.winners=[];if(kind!=='people')s.drawn=[];if(kind!=='results')s.names=Array(N).fill('');if(kind==='all')s.cards=makeCards();})){renderNames();notify('リセットしました。');}
 }
-function initHostEvents(){
- document.querySelectorAll('[data-view]').forEach(b=>b.addEventListener('click',()=>showView(b.dataset.view)));
- $('draw').onclick=draw;$('celebrate').onclick=celebrate;$('closeCelebration').onclick=closeCelebration;
- document.addEventListener('keydown',e=>{if(e.key==='Escape'&&!$('celebration').hidden){closeCelebration();return;}if(e.code==='Space'&&!e.repeat&&activeView==='game'&&!e.altKey&&!e.ctrlKey&&!e.metaKey&&!/INPUT|TEXTAREA|BUTTON|SELECT|SUMMARY/.test(e.target.tagName)&&!e.target.isContentEditable&&!$('confirmDialog').open&&$('celebration').hidden){e.preventDefault();draw();}});
- $('search').oninput=renderPeople;
- for(const [id,value]of [['filterAll','all'],['filterWaiting','waiting'],['filterWon','won']])$(id).onclick=()=>{filter=value;['filterAll','filterWaiting','filterWon'].forEach(x=>$(x).classList.toggle('active',x===id));renderPeople();};
- $('undoWinner').onclick=async()=>{const w=state.winners.at(-1);if(w&&await ask('直前の当選を取り消す',`${nameOf(w.no)} さんの当選記録を取り消し、未当選に戻します。`,'取り消す'))commit(s=>s.winners.pop());};
- $('undoDraw').onclick=async()=>{const n=state.drawn.at(-1);if(n&&await ask('直前の抽選を取り消す',`番号 ${n} を履歴から削除し、抽選候補に戻します。スマホにも反映します。`,'取り消す'))commit(s=>{if(s.winners.some(w=>w.at>=s.drawn.length))return false;s.drawn.pop();});};
- $('applyNames').onclick=async()=>{const lines=$('bulkNames').value.replaceAll('\r','').trim().split('\n').map(x=>x.trim());if(!lines[0]||lines.length>N||lines.some(x=>x.length>60)){notify('名前は1行1人、27人以内・各60文字以内で入力してください。');return;}if(await ask('名前をまとめて反映',`${lines.length}人分をNo.01から順に反映します。残りは空欄になります。`,'反映する')){if(commit(s=>s.names=Array.from({length:N},(_,i)=>lines[i]||''))){renderNames();notify('名前を反映しました。');}}};
- $('sound').onchange=e=>{prefs.sound=e.target.checked;if(!prefs.sound)stopSound();savePrefs();};$('volume').oninput=e=>{prefs.volume=Number(e.target.value);savePrefs();};$('testSound').onclick=fanfare;
- $('publicURL').onchange=e=>{const v=e.target.value.trim();try{if(v){const u=new URL(v);if(u.protocol!=='https:')throw Error();}prefs.publicURL=v;savePrefs();lastQR='';renderQR();}catch{notify('公開URLは https:// で始まるURLを入力してください。');}};
+function hostEvents(){
+ $('draw').onclick=draw;$('togglePeople').onclick=togglePeople;$('bingo').onclick=celebrate;
+ $('openSettings').onclick=()=>{renderNames();$('settingsDialog').showModal();};$('closeSettings').onclick=()=>$('settingsDialog').close();
+ $('fullscreen').onclick=async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen();}catch{notify('ブラウザーのF11キーでも全画面表示できます。');}};
+ document.addEventListener('fullscreenchange',()=>{$('fullscreen').textContent=document.fullscreenElement?'全画面を解除':'全画面';});
+ document.addEventListener('keydown',e=>{if(e.code==='Space'&&!e.repeat&&!e.altKey&&!e.ctrlKey&&!e.metaKey&&!e.target.isContentEditable&&!/INPUT|TEXTAREA|SELECT|BUTTON|SUMMARY/.test(e.target.tagName)&&!document.querySelector('dialog[open]')){e.preventDefault();draw();}});
+ $('closeCelebration').onclick=()=>$('celebration').close();$('celebration').addEventListener('close',stopCelebration);
+ $('enlargeQR').onclick=()=>{renderQR();$('qrDialog').showModal();};$('closeQR').onclick=()=>$('qrDialog').close();
+ $('applyNames').onclick=async()=>{const names=$('bulkNames').value.replaceAll('\r','').trim().split('\n').map(s=>s.trim());if(!names[0]||names.length>N||names.some(n=>n.length>60)){notify('1行1人、27人以内・各60文字以内で入力してください。');return;}if(await ask('名前をまとめて反映',`${names.length}人の名前をNo.01から反映します。残りは空欄になります。`,'反映する'))if(commit(s=>s.names=Array.from({length:N},(_,i)=>names[i]||'')))renderNames();};
+ $('sound').onchange=e=>{prefs.sound=e.target.checked;if(!prefs.sound)$('winnerBell').pause();savePrefs();};$('volume').oninput=e=>{prefs.volume=Number(e.target.value);$('winnerBell').volume=prefs.volume/100;savePrefs();};$('testBell').onclick=playBell;
+ $('publicURL').onchange=e=>{const value=e.target.value.trim();try{if(value&&new URL(value).protocol!=='https:')throw Error();prefs.publicURL=value;savePrefs();qrURL='';renderQR();}catch{notify('公開URLは https:// で始まるURLを入力してください。');}};
+ $('copyLink').onclick=async()=>{try{renderQR();if(!qrURL)throw Error();try{await navigator.clipboard.writeText(qrURL);notify('参加者用リンクをコピーしました。');}catch{await ask('参加者用リンク',qrURL,'閉じる');}}catch{notify('公開URLから開いてください。');}};
  $('retryShare').onclick=startHostSharing;
- $('copyLink').onclick=async()=>{try{const url=viewerURL();try{await navigator.clipboard.writeText(url);notify('参加者用リンクをコピーしました。');}catch{await ask('参加者用リンク',url,'閉じる');}}catch{notify('GitHub Pagesで公開したURLから開いてください。');}};
- $('exportData').onclick=()=>{const blob=new Blob([JSON.stringify(state,null,2)],{type:'application/json'}),url=URL.createObjectURL(blob),a=el('a');a.href=url;a.download=`bingo-backup-${new Date().toISOString().slice(0,10)}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
- $('importData').onclick=()=>$('importFile').click();$('importFile').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f)return;try{if(f.size>1000000)throw Error();const data=JSON.parse(await f.text());if(!validState(data))throw Error();if(await ask('保存データを読み込む','現在の名前・抽選・当選・カードを保存データで上書きします。','読み込む')){if(commit(s=>{s.names=data.names;s.drawn=data.drawn;s.winners=data.winners;s.cards=data.cards;})){renderNames();notify('保存データを読み込みました。');}}}catch{notify('このアプリで保存した正しいJSONデータを選んでください。');}};
- $('resetResults').onclick=()=>reset('results');$('resetPeople').onclick=()=>reset('people');$('resetAll').onclick=()=>reset('all');$('printBtn').onclick=()=>window.print();
- $('fullscreen').onclick=async()=>{try{if(document.fullscreenElement)await document.exitFullscreen();else await document.documentElement.requestFullscreen();}catch{notify('このブラウザーでは全画面表示を利用できません。');}};
- window.addEventListener('storage',e=>{if(e.key===KEY&&e.newValue){try{const s=JSON.parse(e.newValue);if(validState(s)&&!spinning){state=s;render();if(activeView==='setup')renderNames();}}catch{}}});
- window.addEventListener('beforeprint',renderPrint);
+ $('undoWinner').onclick=async()=>{const w=state.winners.at(-1);if(w&&await ask('直前の当選を取り消す',`${nameOf(state,w.no)} さんを未当選に戻します。`,'取り消す'))commit(s=>s.winners.pop());};
+ $('undoDraw').onclick=async()=>{const n=state.drawn.at(-1);if(n&&await ask('直前の抽選を取り消す',`番号 ${n} を履歴から削除し、抽選候補に戻します。`,'取り消す'))commit(s=>{if(s.winners.some(w=>w.at>=s.drawn.length))return false;s.drawn.pop();});};
+ $('exportData').onclick=()=>{const url=URL.createObjectURL(new Blob([JSON.stringify(state,null,2)],{type:'application/json'})),a=node('a');a.href=url;a.download=`bingo-backup-${new Date().toLocaleDateString('sv-SE')}.json`;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);};
+ $('importData').onclick=()=>$('importFile').click();$('importFile').onchange=async e=>{const f=e.target.files[0];e.target.value='';if(!f)return;try{if(f.size>1000000)throw Error();const imported=JSON.parse(await f.text());if(!validState(imported))throw Error();if(await ask('データを読み込む','現在の名前・抽選・当選・カードを保存データで上書きします。','読み込む'))if(commit(s=>{s.names=imported.names;s.drawn=imported.drawn;s.winners=imported.winners;s.cards=imported.cards;}))renderNames();}catch{notify('このアプリで保存した正しいJSONファイルを選んでください。');}};
+ $('resetResults').onclick=()=>reset('results');$('resetPeople').onclick=()=>reset('people');$('resetAll').onclick=()=>reset('all');
+ $('printCards').onclick=()=>{renderPrint();window.print();};window.addEventListener('beforeprint',renderPrint);
+ window.addEventListener('storage',e=>{if(e.key===KEY&&e.newValue&&!spinning)try{const value=JSON.parse(e.newValue);if(validState(value)){state=value;renderHost();if($('settingsDialog').open)renderNames();}}catch{}});
 }
-async function initHost(){
- $('host').hidden=false;
- try {const raw=localStorage.getItem(KEY);if(raw){state=JSON.parse(raw);if(!validState(state)){state=null;notify('保存データの形式を確認できません。元データは上書きしていません。保存データを読み込むか、リセットしてください。');}}}catch{notify('保存データを読み込めませんでした。');}
- if(!state){state=newState();try{const oldNames=JSON.parse(localStorage.getItem('bingo-names')||'null');if(Array.isArray(oldNames))state.names=Array.from({length:N},(_,i)=>typeof oldNames[i]==='string'?oldNames[i].slice(0,60):'');}catch{}}
- initHostEvents();renderNames();render();
- const becomeOwner=()=>{owner=true;try{if(!localStorage.getItem(KEY))localStorage.setItem(KEY,JSON.stringify(state));}catch{notify('自動保存できません。ブラウザーの保存設定を確認してください。');}renderNames();render();startHostSharing();};
- if(navigator.locks){navigator.locks.request('party-bingo-host',{ifAvailable:true},async lock=>{if(!lock){notify('別のタブで進行画面を開いています。操作する場合はそちらを閉じてから、この画面を再読み込みしてください。');return;}becomeOwner();await new Promise(resolve=>window.addEventListener('pagehide',resolve,{once:true}));});}else becomeOwner();
+function viewerEvents(){
+ $('viewerNumbersTab').onclick=()=>toggleViewer(false);$('viewerPeopleTab').onclick=()=>toggleViewer(true);$('viewerReconnect').onclick=startViewerSharing;
+ function toggleViewer(people){$('viewerNumbers').hidden=people;$('viewerPeople').hidden=!people;$('viewerNumbersTab').classList.toggle('active',!people);$('viewerPeopleTab').classList.toggle('active',people);$('viewerNumbersTab').setAttribute('aria-pressed',String(!people));$('viewerPeopleTab').setAttribute('aria-pressed',String(people));}
 }
-async function boot(){
- if(location.hash.startsWith('#watch=')){
-  document.body.classList.add('viewer-mode');$('viewer').hidden=false;
-  try{viewerData=decodeWatch(location.hash.slice(7));renderViewer();$('viewerRetry').onclick=startViewerSharing;startViewerSharing();}
-  catch{viewerStatus('閲覧リンクが正しくありません。メイン画面のQRをもう一度読み取ってください。');$('viewerRetry').hidden=true;}
- }else await initHost();
+function boot(){
+ if(isViewer){
+  $('viewerApp').hidden=false;viewerEvents();
+  try{const raw=location.hash.startsWith('#s=')?location.hash.slice(3):'';viewData=decodePublic(raw);renderViewer();startViewerSharing();}
+  catch{viewerStatus('閲覧リンクが正しくありません。会場の最新QRを読み取ってください。');$('viewerReconnect').disabled=true;}
+  return;
+ }
+ try{const stored=JSON.parse(storage.get(KEY)||'null');state=validState(stored)?stored:null;}catch{}
+ state??=newState();$('hostApp').hidden=false;hostEvents();renderNames();renderHost();
+ const becomeOwner=()=>{owner=true;if(!storage.get(KEY))storage.set(KEY,JSON.stringify(state));renderNames();renderHost();startHostSharing();if(!persistent)notify('一時保存モードです。終了前にデータを保存してください。');};
+ if(navigator.locks)navigator.locks.request('bonenkai-screen-owner-v2',{ifAvailable:true},async lock=>{if(!lock){notify('別のタブで進行中です。そちらを閉じて、この画面を再読み込みしてください。');return;}becomeOwner();await new Promise(resolve=>window.addEventListener('pagehide',resolve,{once:true}));}).catch(becomeOwner);else becomeOwner();
 }
-window.addEventListener('hashchange',()=>location.reload());
-window.addEventListener('pagehide',cleanupShare);document.addEventListener('visibilitychange',()=>{if(document.visibilityState==='visible'&&viewerData&&(!lastContact||Date.now()-lastContact>18000))startViewerSharing();});
+window.addEventListener('pagehide',closeNetwork);window.addEventListener('hashchange',()=>location.reload());document.addEventListener('visibilitychange',()=>{if(isViewer&&viewData&&document.visibilityState==='visible'&&(!lastReceived||Date.now()-lastReceived>18000))startViewerSharing();});
 boot();
